@@ -1,65 +1,29 @@
 import {
   createCodemodeExtension,
-  type CodemodeToolDetails,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { codeBody, minimalTool, type SummaryPart } from "./render.ts";
-
-type SummaryCall = Pick<CodemodeToolDetails["calls"][number], "name" | "status">;
-
-function isSummaryCall(value: unknown): value is SummaryCall {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "name" in value &&
-    typeof value.name === "string" &&
-    "status" in value &&
-    (value.status === "running" ||
-      value.status === "ok" ||
-      value.status === "error" ||
-      value.status === "cancelled")
-  );
-}
-
-export function getCalls(details: unknown): readonly SummaryCall[] {
-  if (details === undefined) return [];
-  if (
-    typeof details !== "object" ||
-    details === null ||
-    !("calls" in details) ||
-    !Array.isArray(details.calls) ||
-    !details.calls.every(isSummaryCall)
-  ) {
-    throw new Error("Unexpected codemode call details");
-  }
-  return details.calls;
-}
+import { getCalls, summarizeActivity } from "./activity.ts";
+import { codeBody, minimalTool, type SummaryPart } from "./tool-render.ts";
 
 function scriptSource(args: unknown) {
   return typeof args === "object" && args !== null && "code" in args && typeof args.code === "string" ? args.code : "";
 }
 
-export function summarize(calls: readonly SummaryCall[], isPartial: boolean, isError: boolean): SummaryPart[] {
-  const counts = new Map<string, number>();
-  for (const call of calls) {
-    const name = call.name === "bash" || call.name === "powershell" ? "command" : call.name;
-    counts.set(name, (counts.get(name) ?? 0) + 1);
-  }
+function summarize(details: unknown, isPartial: boolean, isError: boolean): SummaryPart[] {
+  const calls = getCalls(details);
+  const summary = summarizeActivity([{ calls, active: isPartial, scriptFailed: isError }]);
 
   const parts: SummaryPart[] = [{ count: calls.length }, ` tool call${calls.length === 1 ? "" : "s"}`];
-  for (const [name, count] of counts) {
+  for (const [name, count] of summary.counts) {
     const plural = count !== 1 && ["read", "command", "edit", "write"].includes(name);
     parts.push(" · ", { count }, ` ${name}${plural ? "s" : ""}`);
   }
 
   const notices: SummaryPart[][] = [];
-  const failed = calls.filter((call) => call.status === "error").length;
-  const cancelled = calls.filter((call) => call.status === "cancelled").length;
-  const running = calls.filter((call) => call.status === "running").length;
-  if (failed) notices.push([{ count: failed }, " failed"]);
-  else if (isError) notices.push(["failed"]);
-  if (cancelled) notices.push([{ count: cancelled }, " cancelled"]);
-  if (isPartial) notices.push(running ? [{ count: running }, " running"] : ["running"]);
+  if (summary.failed) notices.push([{ count: summary.failed }, " failed"]);
+  else if (summary.wrapperFailures) notices.push(["failed"]);
+  if (summary.cancelled) notices.push([{ count: summary.cancelled }, " cancelled"]);
+  if (summary.active) notices.push(summary.running ? [{ count: summary.running }, " running"] : ["running"]);
   if (notices.length) {
     parts.push(" (");
     notices.forEach((notice, index) => {
@@ -80,7 +44,7 @@ export default function minimalCodemode(pi: ExtensionAPI) {
       }
       pi.registerTool(minimalTool(tool, {
         call: (_args, argsComplete) => argsComplete ? [{ count: 0 }, " tool calls"] : "writing tool call(s)",
-        result: (_args, result, options, isError) => summarize(getCalls(result.details), options.isPartial, isError),
+        result: (_args, result, options, isError) => summarize(result.details, options.isPartial, isError),
         callBody: (args, theme, context) => codeBody(scriptSource(args).trimEnd(), "javascript", theme, context.lastComponent),
       }));
     },

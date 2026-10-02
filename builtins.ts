@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -14,8 +15,14 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
-import { codeBody, minimalTool, type BodyRenderers, type SummaryPart } from "./render.ts";
-import { shortPath } from "./operations.ts";
+import { codeBody, minimalTool, type BodyRenderers, type SummaryPart } from "./tool-render.ts";
+
+function shortPath(value: string | undefined) {
+  const path = value || ".";
+  const home = homedir();
+  if (path === home) return "~";
+  return path.startsWith(home + "/") ? "~" + path.slice(home.length) : path;
+}
 
 function editStats(patch: string): SummaryPart[] {
   let added = 0;

@@ -7,7 +7,7 @@ import {
 
 const WIDGET_KEY = "pi-minimal-tools-view";
 
-export default function aggregateTools(pi: ExtensionAPI) {
+export default function registerSessionView(pi: ExtensionAPI) {
   let enabled = true;
   let context: ExtensionContext | undefined;
   let restore: (() => void) | undefined;

@@ -4,10 +4,14 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { MouseRegion, Spacer, truncateToWidth, type Component } from "@earendil-works/pi-tui";
-import { isRecord, type OperationStatus } from "./operations.ts";
+import { ActivityShapeError, getCalls, summarizeActivity, type ActivitySnapshot } from "./activity.ts";
 import { minimalTree } from "./tree.ts";
 
 export class ViewShapeError extends Error {}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 // npm development installs can contain another copy of Pi's component classes.
 function isKind(value: unknown, kind: { name: string; prototype: object }) {
@@ -40,20 +44,10 @@ export function findChat(tui: unknown) {
   return chat;
 }
 
-type Call = { name: string; status: OperationStatus; args?: string; error?: string };
-type ToolSnapshot = { calls: readonly Call[]; active: boolean; scriptFailed: boolean };
 type Group = { tools: Component[]; anchor: Component };
 type GroupInteraction = { revealed: WeakSet<Component>; requestRender: () => void };
 
-function isCall(value: unknown): value is Call {
-  return isRecord(value) && typeof value.name === "string" &&
-    (value.args === undefined || typeof value.args === "string") &&
-    (value.error === undefined || typeof value.error === "string") &&
-    (value.status === "running" || value.status === "ok" ||
-      value.status === "error" || value.status === "cancelled");
-}
-
-function toolSnapshot(component: unknown): ToolSnapshot {
+function toolSnapshot(component: unknown): ActivitySnapshot {
   if (!isRecord(component) || typeof component.toolName !== "string" ||
     typeof component.isPartial !== "boolean") {
     throw new ViewShapeError("Pi's tool component fields changed");
@@ -65,14 +59,13 @@ function toolSnapshot(component: unknown): ToolSnapshot {
   const failed = isRecord(result) && result.isError === true;
   if (component.toolName === "codemode") {
     const details = isRecord(result) ? result.details : undefined;
-    if (details !== undefined && (!isRecord(details) || !Array.isArray(details.calls) ||
-      !details.calls.every(isCall))) {
-      throw new ViewShapeError("Unexpected codemode call details");
+    try {
+      // Each update replaces a complete snapshot. Parallel calls can temporarily share an id.
+      return { calls: getCalls(details), active: component.isPartial, scriptFailed: failed };
+    } catch (error) {
+      if (!(error instanceof ActivityShapeError)) throw error;
+      throw new ViewShapeError(error.message);
     }
-    // Each update replaces a complete snapshot. Parallel calls can temporarily share an id.
-    const calls = isRecord(details) && Array.isArray(details.calls) && details.calls.every(isCall)
-      ? details.calls : [];
-    return { calls, active: component.isPartial, scriptFailed: failed };
   }
   return {
     calls: [{ name: component.toolName, status: component.isPartial ? "running" : failed ? "error" : "ok" }],
@@ -81,29 +74,7 @@ function toolSnapshot(component: unknown): ToolSnapshot {
   };
 }
 
-export function summarizeTools(tools: readonly unknown[]) {
-  const snapshots = tools.map(toolSnapshot);
-  const calls = snapshots.flatMap((snapshot) => snapshot.calls);
-  const counts = new Map<string, number>();
-  for (const call of calls) {
-    const name = call.name === "bash" || call.name === "powershell" ? "command" : call.name;
-    counts.set(name, (counts.get(name) ?? 0) + 1);
-  }
-  return {
-    total: calls.length,
-    counts,
-    running: calls.filter((call) => call.status === "running").length,
-    // A failed wrapper does not add another failure when its operation already failed.
-    failed: snapshots.reduce((total, snapshot) => {
-      const failed = snapshot.calls.filter((call) => call.status === "error").length;
-      return total + (failed || (snapshot.scriptFailed ? 1 : 0));
-    }, 0),
-    cancelled: calls.filter((call) => call.status === "cancelled").length,
-    active: snapshots.some((snapshot) => snapshot.active),
-  };
-}
-
-export function summaryText(summary: ReturnType<typeof summarizeTools>) {
+function summaryText(summary: ReturnType<typeof summarizeActivity>) {
   const parts: string[] = [];
   const commands = summary.counts.get("command");
   if (commands) parts.push(`ran ${commands} command${commands === 1 ? "" : "s"}`);
@@ -122,15 +93,16 @@ export function summaryText(summary: ReturnType<typeof summarizeTools>) {
   if (summary.running) parts.push(`${summary.running} running`);
   if (summary.cancelled) parts.push(`${summary.cancelled} cancelled`);
   const text = parts.join(" · ");
-  if (summary.failed) return `${text ? text + " " : ""}(${summary.failed} failed)`;
+  const failed = summary.failed + summary.wrapperFailures;
+  if (failed) return `${text ? text + " " : ""}(${failed} failed)`;
   return text || (summary.active ? "working…" : "no operations");
 }
 
-function summaryComponent(group: Group, theme: Theme, padding: number, interaction?: GroupInteraction): Component {
+function summaryComponent(group: Group, theme: Theme, padding: number, interaction: GroupInteraction): Component {
   const summary: Component = {
     render(width) {
-      const summary = summarizeTools(group.tools);
-      const color = summary.failed ? "error" : summary.cancelled ? "warning" : "muted";
+      const summary = summarizeActivity(group.tools.map(toolSnapshot));
+      const color = summary.failed || summary.wrapperFailures ? "error" : summary.cancelled ? "warning" : "muted";
       const prefix = theme.fg(summary.active ? "accent" : color, summary.active ? "◌" : "●");
       const inset = Math.min(padding, Math.max(0, width));
       const line = prefix + " " + theme.fg("muted", summaryText(summary));
@@ -138,7 +110,6 @@ function summaryComponent(group: Group, theme: Theme, padding: number, interacti
     },
     invalidate() {},
   };
-  if (!interaction) return summary;
   return new MouseRegion(summary, (event) => {
     // The summary's first row is spacing, not a click target.
     if (event.type !== "click" || event.button !== "left" || event.y !== 1) return undefined;
@@ -189,11 +160,11 @@ function assistantView(component: Component) {
 }
 
 // The stored components never change. Only this render's child list is projected.
-export function buildTranscriptView(children: readonly Component[], theme: Theme, padding = 1, interaction?: GroupInteraction) {
+function buildTranscriptView(children: readonly Component[], theme: Theme, padding: number, interaction: GroupInteraction) {
   const view: Component[] = [];
   let group: Group | undefined;
   function finishGroup() {
-    if (group && interaction?.revealed.has(group.anchor)) {
+    if (group && interaction.revealed.has(group.anchor)) {
       view.push(minimalTree(group.tools, theme, padding));
     }
     group = undefined;

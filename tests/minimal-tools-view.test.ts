@@ -1,24 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { minimalTool, codeBody } from "../render.ts";
-import { getCalls, summarize as summarizeBlock } from "../codemode.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { minimalTool, codeBody } from "../tool-render.ts";
+import minimalToolsView from "../index.ts";
 import {
   AssistantMessageComponent,
   ToolExecutionComponent,
   UserMessageComponent,
   getMarkdownTheme,
   createReadToolDefinition,
+  DefaultResourceLoader,
+  SettingsManager,
   initTheme,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, ProcessTerminal, Text, TuiMainScreen, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
-  buildTranscriptView,
   findChat,
   installTranscriptView,
   ViewShapeError,
-  summarizeTools,
-  summaryText,
 } from "../transcript.ts";
 
 initTheme("dark");
@@ -35,6 +37,31 @@ const captureTool = {
 new ToolExecutionComponent("capture", "capture", {}, {}, captureTool, tui, process.cwd());
 if (!renderTheme) throw new Error("Expected Pi's tool renderer theme");
 const activeTheme = renderTheme;
+
+const codemodeTool = await (async () => {
+  const directory = mkdtempSync(join(tmpdir(), "minimal-tools-view-"));
+  try {
+    const loader = new DefaultResourceLoader({
+      cwd: directory,
+      agentDir: directory,
+      settingsManager: SettingsManager.inMemory(),
+      extensionFactories: [minimalToolsView],
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+    });
+    await loader.reload();
+    const result = loader.getExtensions();
+    assert.deepEqual(result.errors, []);
+    const definition = result.extensions[0]?.tools.get("codemode")?.definition;
+    if (!definition) throw new Error("Expected the registered codemode tool");
+    return definition;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+})();
 
 function assistant(text = "", thinking = "private reasoning", toolCall = false, stopReason = "stop") {
   return new AssistantMessageComponent({
@@ -60,7 +87,7 @@ function call(name: string, status = "ok", args: Record<string, unknown> = {}, e
 
 let toolId = 0;
 function tool(name: string, calls: ReturnType<typeof call>[] = [], isPartial = false, isError = false) {
-  const definition = minimalTool({
+  const definition = name === "codemode" ? codemodeTool : minimalTool({
     ...createReadToolDefinition(process.cwd()),
     name,
     renderResult(result) {
@@ -68,12 +95,10 @@ function tool(name: string, calls: ReturnType<typeof call>[] = [], isPartial = f
     },
   }, {
     call: () => name,
-    result: (_args, result, options, isError) => name === "codemode"
-      ? summarizeBlock(getCalls(result.details), options.isPartial, isError)
-      : name,
+    result: () => name,
     callBody: (_args, theme, context) => codeBody("fixture_script();", "javascript", theme, context.lastComponent),
   });
-  const component = new ToolExecutionComponent(name, String(++toolId), {}, {}, definition, tui, process.cwd());
+  const component = new ToolExecutionComponent(name, String(++toolId), { code: "fixture_script();" }, {}, definition, tui, process.cwd());
   component.updateResult({
     content: [{ type: "text", text: isError ? "failure" : "result" }],
     details: name === "codemode" ? { calls } : undefined,
@@ -88,8 +113,17 @@ function plain(lines: readonly string[]) {
 
 function render(children: Container["children"], width = 160) {
   const container = new Container();
-  container.children = buildTranscriptView(children, activeTheme);
-  return plain(container.render(width));
+  container.children = children;
+  const restore = installTranscriptView(container, {
+    enabled: () => true, theme: () => activeTheme, padding: () => 1,
+    requestRender: () => {},
+    incompatible: (error) => { throw error; },
+  });
+  try {
+    return plain(container.render(width));
+  } finally {
+    restore();
+  }
 }
 
 function clickSummary(chat: Container, text: string, overrides: Partial<TuiMouseEvent> = {}) {
@@ -144,12 +178,18 @@ test("user messages split groups; thinking-only turns do not", () => {
 test("snapshots count parallel calls with temporary duplicate ids only once per snapshot", () => {
   const component = tool("codemode", [call("read", "running"), call("read", "running")], true);
   assert.match(render([component]), /◌ read 2 times · 2 running/);
+  assert.equal(plain(component.render(160)).trim(), "● 2 tool calls · 2 reads (2 running)");
   component.updateResult({ content: [], details: { calls: [call("read"), call("read", "cancelled")] }, isError: false });
   assert.equal(render([component]).trim(), "● read 2 times · 1 cancelled");
+  assert.equal(plain(component.render(160)).trim(), "● 2 tool calls · 2 reads (1 cancelled)");
 });
 
 test("wrapper failures remain visible without disclosing the execution route", () => {
-  assert.equal(render([tool("codemode", [], false, true)]).trim(), "● (1 failed)");
+  const emptyFailure = tool("codemode", [], false, true);
+  assert.equal(render([emptyFailure]).trim(), "● (1 failed)");
+  assert.equal(plain(emptyFailure.render(160)).trim(), "● 0 tool calls (failed)");
+  const failedCalls = tool("codemode", [call("read", "error"), call("edit", "error")], false, true);
+  assert.equal(plain(failedCalls.render(160)).trim(), "● 2 tool calls · 1 read · 1 edit (2 failed)");
   assert.equal(render([tool("codemode", [call("read")], false, true)]).trim(),
     "● read 1 time (1 failed)");
   for (const name of ["read", "bash", "powershell"]) {
@@ -167,17 +207,21 @@ test("activity wording covers singular and plural counts without a tool-call tot
   assert.equal(output,
     "● ran 3 commands · read 2 times · edited 1 time · wrote 2 times · searched text 1 time · searched for files 1 time · listed files 1 time · used lookup 1 time");
   assert.equal(render([tool("codemode")]).trim(), "● no operations");
-  assert.equal(render([tool("codemode", [], true)]).trim(), "◌ working…");
+  const active = tool("codemode", [], true);
+  assert.equal(render([active]).trim(), "◌ working…");
+  assert.equal(plain(active.render(160)).trim(), "● 0 tool calls (running)");
 });
 
 test("failures appear last and failed wrappers do not double-count operations", () => {
-  const summary = summarizeTools([
-    { toolName: "bash", isPartial: false, result: { isError: true } },
-    { toolName: "codemode", isPartial: false, result: { isError: true,
-      details: { calls: [call("read", "cancelled"), call("edit", "error")] } } },
-  ]);
-  assert.equal(summaryText(summary),
-    "ran 1 command · read 1 time · edited 1 time · 1 cancelled (2 failed)");
+  const children = [
+    tool("bash", [], false, true),
+    tool("codemode", [call("read", "cancelled"), call("edit", "error")], false, true),
+  ];
+  assert.equal(render(children).trim(),
+    "● ran 1 command · read 1 time · edited 1 time · 1 cancelled (2 failed)");
+  children.push(tool("codemode", [call("write")], false, true));
+  assert.equal(render(children).trim(),
+    "● ran 1 command · read 1 time · edited 1 time · wrote 1 time · 1 cancelled (3 failed)");
 });
 
 test("assistant errors and abort notices survive thinking removal", () => {
@@ -186,10 +230,19 @@ test("assistant errors and abort notices survive thinking removal", () => {
 });
 
 test("summary lines fit narrow widths and rerender after a resize", () => {
-  const view = buildTranscriptView([tool("codemode", [call("read"), call("bash")])], activeTheme);
-  for (const width of [0, 1, 5, 20, 80]) {
-    const lines = view.flatMap((component) => component.render(width));
-    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+  const chat = new Container();
+  chat.children = [tool("codemode", [call("read"), call("bash")])];
+  const restore = installTranscriptView(chat, {
+    enabled: () => true, theme: () => activeTheme, padding: () => 1,
+    requestRender: () => {},
+    incompatible: (error) => { throw error; },
+  });
+  try {
+    for (const width of [0, 1, 5, 20, 80]) {
+      assert.ok(chat.render(width).every((line) => visibleWidth(line) <= width));
+    }
+  } finally {
+    restore();
   }
   assert.match(render([tool("read")], 80), /read 1 time/);
 });
@@ -263,20 +316,29 @@ test("render failure always restores the original child arrays", () => {
 });
 
 test("incompatible codemode details fail visibly and retain normal rendering", () => {
-  const chat = new Container();
-  const component = tool("codemode");
-  component.updateResult({ content: [{ type: "text", text: "original output" }], details: { calls: "changed" }, isError: false });
-  chat.addChild(component);
-  const normal = chat.render(160);
-  let reported = false;
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { reported = error instanceof ViewShapeError; },
-  });
-  assert.deepEqual(chat.render(160), normal);
-  assert.ok(reported);
-  restore();
+  for (const details of [
+    null,
+    {},
+    { calls: "changed" },
+    { calls: [null] },
+    { calls: [{ name: 42, status: "ok" }] },
+    { calls: [{ name: "read", status: "changed" }] },
+  ]) {
+    const chat = new Container();
+    const component = tool("codemode");
+    component.updateResult({ content: [{ type: "text", text: "original output" }], details, isError: false });
+    chat.addChild(component);
+    const normal = chat.render(160);
+    let reported = false;
+    const restore = installTranscriptView(chat, {
+      enabled: () => true, theme: () => activeTheme, padding: () => 1,
+      requestRender: () => {},
+      incompatible: (error) => { reported = error instanceof ViewShapeError; },
+    });
+    assert.deepEqual(chat.render(160), normal);
+    assert.ok(reported);
+    restore();
+  }
 });
 
 test("Pi's global detail expansion changes only what revealed groups display", () => {

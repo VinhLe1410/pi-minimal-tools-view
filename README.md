@@ -90,11 +90,11 @@ Pi supplies the runtime peer dependencies. Matching host packages are developmen
 - `index.ts`: the only extension entry point.
 - `builtins.ts`: built-in tool definitions and minimal renderers.
 - `codemode.ts`: codemode definition and per-block renderer.
-- `aggregate.ts`: session lifecycle, working label, and toggle command.
-- `transcript.ts`: grouping and visibility.
-- `operations.ts`: path shortening and object guards.
+- `activity.ts`: shared call validation and activity counts.
+- `session-view.ts`: session lifecycle, working label, and toggle command.
+- `transcript.ts`: host-shape checks, grouping, and visibility.
 - `tree.ts`: branch connectors and mouse forwarding.
-- `render.ts`: shared rendering and detailed components.
+- `tool-render.ts`: shared tool rendering and detailed components.
 - `tests/minimal-tools-view.test.ts`: UI regression tests.
 
 The package is distributed through Git. It is marked private to prevent accidental npm publication.

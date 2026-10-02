@@ -1,7 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Container, truncateToWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { isRecord } from "./operations.ts";
-import { withMinimalTreeRow } from "./render.ts";
+import { withMinimalTreeRow } from "./tool-render.ts";
 
 class TreeRow implements Component {
   private contentWidth = 0;
@@ -17,7 +16,7 @@ class TreeRow implements Component {
   ) {}
 
   private withTreeStyle<T>(action: () => T) {
-    const state = isRecord(this.tool) ? this.tool.rendererState : undefined;
+    const state = "rendererState" in this.tool ? this.tool.rendererState : undefined;
     return withMinimalTreeRow(state, action);
   }
 
