@@ -163,16 +163,21 @@ function assistantView(component: Component) {
 function buildTranscriptView(children: readonly Component[], theme: Theme, padding: number, interaction: GroupInteraction) {
   const view: Component[] = [];
   let group: Group | undefined;
+  let pendingSpacers: Component[] = [];
   function finishGroup() {
     if (group && interaction.revealed.has(group.anchor)) {
       view.push(minimalTree(group.tools, theme, padding));
     }
+    view.push(...pendingSpacers);
+    pendingSpacers = [];
     group = undefined;
   }
   for (const child of children) {
     if (isKind(child, ToolExecutionComponent)) {
       // Validate before hiding anything, so an incompatible host retains its normal view.
       toolSnapshot(child);
+      // Only spacers between tools belong to the compressed group.
+      pendingSpacers = [];
       if (!group) {
         group = { tools: [], anchor: child };
         view.push(summaryComponent(group, theme, padding, interaction));
@@ -185,7 +190,10 @@ function buildTranscriptView(children: readonly Component[], theme: Theme, paddi
         view.push(assistant);
       }
     } else {
-      if (isKind(child, Spacer) && group) continue;
+      if (isKind(child, Spacer) && group) {
+        pendingSpacers.push(child);
+        continue;
+      }
       finishGroup();
       view.push(child);
     }

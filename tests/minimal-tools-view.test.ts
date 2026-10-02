@@ -16,7 +16,7 @@ import {
   initTheme,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, ProcessTerminal, Text, TuiMainScreen, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, ProcessTerminal, Spacer, Text, TuiMainScreen, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
   findChat,
   installTranscriptView,
@@ -152,27 +152,53 @@ test("the six screenshot rows become one 22-call summary", () => {
   assert.doesNotMatch(output, /Thinking|reasoning|result|tool calls?|codemode|script/);
 });
 
-test("visible assistant text splits groups even when followed by tools", () => {
-  const output = render([
-    tool("codemode", [call("read")]),
-    assistant(),
-    tool("codemode", [call("bash")]),
-    assistant("Found the inventory.", "thinking", true),
-    tool("read"),
-    assistant("The cheese is in the fridge."),
-  ]);
-  assert.match(output, /ran 1 command · read 1 time[\s\S]*Found the inventory\.[\s\S]*read 1 time[\s\S]*The cheese/);
-  assert.equal((output.match(/●/g) ?? []).length, 2);
-});
+test("aggregation preserves conversation order and spacing as messages arrive and groups open", () => {
+  const chat = new Container();
+  chat.children = [
+    tool("read"), new Spacer(1), assistant(), new Spacer(1), tool("bash"),
+  ];
+  const restore = installTranscriptView(chat, {
+    enabled: () => true, theme: () => activeTheme, padding: () => 1,
+    requestRender: () => {},
+    incompatible: (error) => { throw error; },
+  });
+  // Remove color and horizontal padding, but retain every rendered row.
+  const lines = (component: Component) => plain(component.render(160)).split("\n").map((line) => line.trim());
+  const header = ["", "● ran 1 command · read 1 time"];
+  try {
+    assert.deepEqual(lines(chat), header);
 
-test("user messages split groups; thinking-only turns do not", () => {
-  const output = render([
-    tool("read"), assistant(),
-    new UserMessageComponent("Where's the cheese?"),
-    tool("read"),
-  ]);
-  assert.equal((output.match(/read 1 time/g) ?? []).length, 2);
-  assert.match(output, /Where's the cheese/);
+    const steering = new UserMessageComponent("Check the fridge first.");
+    const followUp = new UserMessageComponent("What else is there?");
+    chat.addChild(assistant());
+    // Pi inserts a spacer before each user message, outside its colored padding.
+    chat.addChild(new Spacer(1));
+    chat.addChild(steering);
+    chat.addChild(tool("read"));
+    chat.addChild(assistant("Found the inventory.", "thinking", true));
+    chat.addChild(tool("edit"));
+    chat.addChild(assistant("The cheese is in the fridge."));
+    chat.addChild(new Spacer(1));
+    chat.addChild(followUp);
+
+    const conversation = [
+      "", ...lines(steering),
+      "", "● read 1 time",
+      ...lines(assistant("Found the inventory.", "", true)),
+      "", "● edited 1 time",
+      ...lines(assistant("The cheese is in the fridge.", "")),
+      "", ...lines(followUp),
+    ];
+    assert.deepEqual(lines(chat), [...header, ...conversation]);
+
+    assert.ok(clickSummary(chat, "ran 1 command")?.handled);
+    assert.deepEqual(lines(chat), [...header, "├─ read", "└─ bash", ...conversation]);
+
+    assert.ok(clickSummary(chat, "ran 1 command")?.handled);
+    assert.deepEqual(lines(chat), [...header, ...conversation]);
+  } finally {
+    restore();
+  }
 });
 
 test("snapshots count parallel calls with temporary duplicate ids only once per snapshot", () => {
