@@ -3,49 +3,63 @@ import { test } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { minimalTool, codeBody } from "../tool-render.ts";
 import minimalToolsView from "../index.ts";
 import {
   AssistantMessageComponent,
   ToolExecutionComponent,
   UserMessageComponent,
-  getMarkdownTheme,
+  createBashToolDefinition,
+  createCodemodeExtension,
+  createEditToolDefinition,
+  createPowerShellToolDefinition,
   createReadToolDefinition,
   DefaultResourceLoader,
   SettingsManager,
+  getMarkdownTheme,
   initTheme,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, ProcessTerminal, Spacer, Text, TuiMainScreen, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import {
-  findChat,
-  installTranscriptView,
-  ViewShapeError,
-} from "../transcript.ts";
+import { Container, MouseRegion, ProcessTerminal, Spacer, Text, TuiMainScreen, stripTerminalSequences, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { findChat, installTranscriptView, ViewShapeError } from "../transcript.ts";
 
 initTheme("dark");
 const tui = new TuiMainScreen(new ProcessTerminal());
-// Obtain the real theme passed to renderers, without importing private module paths.
 let renderTheme: Theme | undefined;
-const captureTool = {
-  name: "capture",
-  renderCall(_args: unknown, value: Theme) {
-    renderTheme = value;
+// Obtain the host's renderer theme without importing private modules.
+new ToolExecutionComponent("capture", "capture", {}, {}, {
+  renderCall(_args: unknown, theme: Theme) {
+    renderTheme = theme;
     return new Text("", 0, 0);
   },
-};
-new ToolExecutionComponent("capture", "capture", {}, {}, captureTool, tui, process.cwd());
+}, tui, process.cwd());
 if (!renderTheme) throw new Error("Expected Pi's tool renderer theme");
 const activeTheme = renderTheme;
+const addonEvents: TuiMouseEvent[] = [];
 
-const codemodeTool = await (async () => {
+const extensions = await (async () => {
   const directory = mkdtempSync(join(tmpdir(), "minimal-tools-view-"));
   try {
     const loader = new DefaultResourceLoader({
       cwd: directory,
       agentDir: directory,
       settingsManager: SettingsManager.inMemory(),
-      extensionFactories: [minimalToolsView],
+      extensionFactories: [
+        minimalToolsView,
+        createCodemodeExtension(),
+        (pi) => pi.registerTool({
+          ...createReadToolDefinition(directory),
+          name: "lookup",
+          renderShell: "self",
+          renderCall: () => new Text("lookup", 0, 0),
+          renderResult: (_result, options, theme) => new MouseRegion(
+            new Text(theme.fg("accent", options.expanded ? "LOOKUP_DETAILS" : "LOOKUP_PREVIEW"), 0, 0),
+            (event) => {
+              addonEvents.push(event);
+              return { handled: true };
+            },
+          ),
+        }),
+      ],
       noExtensions: true,
       noSkills: true,
       noPromptTemplates: true,
@@ -55,13 +69,19 @@ const codemodeTool = await (async () => {
     await loader.reload();
     const result = loader.getExtensions();
     assert.deepEqual(result.errors, []);
-    const definition = result.extensions[0]?.tools.get("codemode")?.definition;
-    if (!definition) throw new Error("Expected the registered codemode tool");
-    return definition;
+    return result.extensions;
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 })();
+
+const definitions = [
+  createReadToolDefinition(process.cwd()),
+  createBashToolDefinition(process.cwd()),
+  createPowerShellToolDefinition(process.cwd()),
+  createEditToolDefinition(process.cwd()),
+  ...extensions.flatMap((extension) => [...extension.tools.values()].map((tool) => tool.definition)),
+];
 
 function assistant(text = "", thinking = "private reasoning", toolCall = false, stopReason = "stop") {
   return new AssistantMessageComponent({
@@ -71,9 +91,7 @@ function assistant(text = "", thinking = "private reasoning", toolCall = false, 
       ...(text ? [{ type: "text" as const, text }] : []),
       ...(toolCall ? [{ type: "toolCall" as const, id: "call", name: "codemode", arguments: { code: "" } }] : []),
     ],
-    api: "openai-responses",
-    provider: "openai",
-    model: "test",
+    api: "openai-responses", provider: "openai", model: "test",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     stopReason: stopReason === "aborted" ? "aborted" : stopReason === "error" ? "error" : "stop",
@@ -81,24 +99,16 @@ function assistant(text = "", thinking = "private reasoning", toolCall = false, 
   }, true, getMarkdownTheme());
 }
 
-function call(name: string, status = "ok", args: Record<string, unknown> = {}, error?: string) {
-  return { name, status, id: "same-temporary-id", args: JSON.stringify(args), error };
+function call(name: string, status = "ok") {
+  return { name, status, id: "same-temporary-id", args: "{}" };
 }
 
 let toolId = 0;
 function tool(name: string, calls: ReturnType<typeof call>[] = [], isPartial = false, isError = false) {
-  const definition = name === "codemode" ? codemodeTool : minimalTool({
-    ...createReadToolDefinition(process.cwd()),
-    name,
-    renderResult(result) {
-      return new Text(result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"), 0, 0);
-    },
-  }, {
-    call: () => name,
-    result: () => name,
-    callBody: (_args, theme, context) => codeBody("fixture_script();", "javascript", theme, context.lastComponent),
-  });
-  const component = new ToolExecutionComponent(name, String(++toolId), { code: "fixture_script();" }, {}, definition, tui, process.cwd());
+  const definition = definitions.find((tool) => tool.name === name);
+  const component = new ToolExecutionComponent(name, String(++toolId), {
+    path: "src/a.ts", command: "echo fixture", code: "fixture_script();",
+  }, {}, definition, tui, process.cwd());
   component.updateResult({
     content: [{ type: "text", text: isError ? "failure" : "result" }],
     details: name === "codemode" ? { calls } : undefined,
@@ -108,36 +118,65 @@ function tool(name: string, calls: ReturnType<typeof call>[] = [], isPartial = f
 }
 
 function plain(lines: readonly string[]) {
-  return lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\][^\x07]*\x07/g, "");
+  return stripTerminalSequences(lines.join("\n"));
 }
 
-function render(children: Container["children"], width = 160) {
-  const container = new Container();
-  container.children = children;
-  const restore = installTranscriptView(container, {
+function attach(chat: Container, options: Partial<Parameters<typeof installTranscriptView>[1]> = {}) {
+  return installTranscriptView(chat, {
     enabled: () => true, theme: () => activeTheme, padding: () => 1,
     requestRender: () => {},
     incompatible: (error) => { throw error; },
+    ...options,
   });
+}
+
+function render(children: Container["children"]) {
+  const chat = new Container();
+  chat.children = children;
+  const restore = attach(chat);
   try {
-    return plain(container.render(width));
+    return plain(chat.render(160));
   } finally {
     restore();
   }
 }
 
-function clickSummary(chat: Container, text: string, overrides: Partial<TuiMouseEvent> = {}) {
+function clickRow(chat: Component, text: string, overrides: Partial<TuiMouseEvent> = {}) {
   const lines = chat.render(160);
   const y = lines.findIndex((line) => plain([line]).includes(text));
-  assert.ok(y >= 0, `Missing summary: ${text}`);
-  return chat.handleMouse({
-    type: "click", button: "left", x: 5, y, screenX: 5, screenY: y,
+  assert.ok(y >= 0, `Missing row: ${text}`);
+  return chat.handleMouse?.({
+    type: "click", button: "left", x: 7, y, screenX: 7, screenY: y,
     width: 160, height: lines.length, shift: false, alt: false, ctrl: false,
     ...overrides,
   });
 }
 
-test("the six screenshot rows become one 22-call summary", () => {
+// Tree rows replace the host's leading spacer with a branch connector.
+function nativeLines(component: Component, width: number) {
+  const lines = component.render(width).slice();
+  while (lines[0] === "") lines.shift();
+  return lines;
+}
+
+function assertNativeRows(chat: Container, tools: readonly Component[], width = 160) {
+  const actual = chat.render(width).slice(2);
+  const expected = tools.flatMap((tool) => nativeLines(tool, width - 4));
+  assert.deepEqual(plain(actual).split("\n").map((line) => line.slice(4)), plain(expected).split("\n"));
+  // Native ANSI styling remains intact after the tree prefix.
+  assert.ok(actual.every((line, index) => line.endsWith(expected[index])));
+}
+
+test("the view registers no tools and coexists with host codemode and addons", () => {
+  const [view, codemode, addon] = extensions;
+  assert.ok(view && codemode && addon);
+  assert.equal(view.tools.size, 0);
+  assert.ok(view.commands.has("minimal-tools-view"));
+  assert.deepEqual([...codemode.tools.keys()], ["codemode"]);
+  assert.deepEqual([...addon.tools.keys()], ["lookup"]);
+});
+
+test("consecutive codemode snapshots become one aggregate without exposing their contents", () => {
   const rows: Component[] = [
     [call("bash"), call("read"), call("read")],
     [...Array.from({ length: 4 }, () => call("read")), call("bash")],
@@ -147,27 +186,19 @@ test("the six screenshot rows become one 22-call summary", () => {
     [call("read"), call("read"), call("bash")],
   ].map((calls) => tool("codemode", calls));
   rows.splice(5, 0, assistant());
-  const output = render(rows);
-  assert.equal(output.trim(), "● ran 13 commands · read 9 times (1 failed)");
-  assert.doesNotMatch(output, /Thinking|reasoning|result|tool calls?|codemode|script/);
+  assert.equal(render(rows).trim(), "● ran 13 commands · read 9 times (1 failed)");
 });
 
 test("aggregation preserves conversation order and spacing as messages arrive and groups open", () => {
+  const first = [tool("read"), tool("bash")];
   const chat = new Container();
-  chat.children = [
-    tool("read"), new Spacer(1), assistant(), new Spacer(1), tool("bash"),
-  ];
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
+  chat.children = [first[0], new Spacer(1), assistant(), new Spacer(1), first[1]];
+  const restore = attach(chat);
   // Remove color and horizontal padding, but retain every rendered row.
   const lines = (component: Component) => plain(component.render(160)).split("\n").map((line) => line.trim());
   const header = ["", "● ran 1 command · read 1 time"];
   try {
     assert.deepEqual(lines(chat), header);
-
     const steering = new UserMessageComponent("Check the fridge first.");
     const followUp = new UserMessageComponent("What else is there?");
     chat.addChild(assistant());
@@ -180,7 +211,6 @@ test("aggregation preserves conversation order and spacing as messages arrive an
     chat.addChild(assistant("The cheese is in the fridge."));
     chat.addChild(new Spacer(1));
     chat.addChild(followUp);
-
     const conversation = [
       "", ...lines(steering),
       "", "● read 1 time",
@@ -190,64 +220,52 @@ test("aggregation preserves conversation order and spacing as messages arrive an
       "", ...lines(followUp),
     ];
     assert.deepEqual(lines(chat), [...header, ...conversation]);
-
-    assert.ok(clickSummary(chat, "ran 1 command")?.handled);
-    assert.deepEqual(lines(chat), [...header, "├─ read", "└─ bash", ...conversation]);
-
-    assert.ok(clickSummary(chat, "ran 1 command")?.handled);
+    assert.ok(clickRow(chat, "ran 1 command")?.handled);
+    const revealed = lines(chat);
+    assert.deepEqual(revealed.slice(0, header.length), header);
+    assert.deepEqual(revealed.slice(-conversation.length), conversation);
+    assert.equal(revealed.length, header.length + conversation.length +
+      first.reduce((height, tool) => height + nativeLines(tool, 156).length, 0));
+    assert.ok(clickRow(chat, "ran 1 command")?.handled);
     assert.deepEqual(lines(chat), [...header, ...conversation]);
   } finally {
     restore();
   }
 });
 
-test("snapshots count parallel calls with temporary duplicate ids only once per snapshot", () => {
+test("activity counts track snapshots, cancellation, and failures without double-counting wrappers", () => {
   const component = tool("codemode", [call("read", "running"), call("read", "running")], true);
-  assert.match(render([component]), /◌ read 2 times · 2 running/);
-  assert.equal(plain(component.render(160)).trim(), "● 2 tool calls · 2 reads (2 running)");
-  component.updateResult({ content: [], details: { calls: [call("read"), call("read", "cancelled")] }, isError: false });
+  assert.equal(render([component]).trim(), "◌ read 2 times · 2 running");
+  component.updateResult({
+    content: [], details: { calls: [call("read"), call("read", "cancelled")] }, isError: false,
+  });
   assert.equal(render([component]).trim(), "● read 2 times · 1 cancelled");
-  assert.equal(plain(component.render(160)).trim(), "● 2 tool calls · 2 reads (1 cancelled)");
-});
-
-test("wrapper failures remain visible without disclosing the execution route", () => {
-  const emptyFailure = tool("codemode", [], false, true);
-  assert.equal(render([emptyFailure]).trim(), "● (1 failed)");
-  assert.equal(plain(emptyFailure.render(160)).trim(), "● 0 tool calls (failed)");
-  const failedCalls = tool("codemode", [call("read", "error"), call("edit", "error")], false, true);
-  assert.equal(plain(failedCalls.render(160)).trim(), "● 2 tool calls · 1 read · 1 edit (2 failed)");
-  assert.equal(render([tool("codemode", [call("read")], false, true)]).trim(),
-    "● read 1 time (1 failed)");
-  for (const name of ["read", "bash", "powershell"]) {
-    assert.equal(render([tool("codemode", [call(name, "error")], false, true)]).trim(),
-      render([tool(name, [], false, true)]).trim());
-    assert.equal(render([tool("codemode", [call(name)])]).trim(), render([tool(name)]).trim());
-  }
-});
-
-test("activity wording covers singular and plural counts without a tool-call total", () => {
-  const output = render([tool("codemode", [
-    call("read"), call("read"), call("bash"), call("powershell"), call("bash"),
-    call("edit"), call("write"), call("write"), call("grep"), call("find"), call("ls"), call("lookup"),
-  ])]).trim();
-  assert.equal(output,
-    "● ran 3 commands · read 2 times · edited 1 time · wrote 2 times · searched text 1 time · searched for files 1 time · listed files 1 time · used lookup 1 time");
-  assert.equal(render([tool("codemode")]).trim(), "● no operations");
-  const active = tool("codemode", [], true);
-  assert.equal(render([active]).trim(), "◌ working…");
-  assert.equal(plain(active.render(160)).trim(), "● 0 tool calls (running)");
-});
-
-test("failures appear last and failed wrappers do not double-count operations", () => {
   const children = [
     tool("bash", [], false, true),
     tool("codemode", [call("read", "cancelled"), call("edit", "error")], false, true),
+    tool("codemode", [call("write")], false, true),
+    tool("codemode", [], false, true),
   ];
   assert.equal(render(children).trim(),
-    "● ran 1 command · read 1 time · edited 1 time · 1 cancelled (2 failed)");
-  children.push(tool("codemode", [call("write")], false, true));
-  assert.equal(render(children).trim(),
-    "● ran 1 command · read 1 time · edited 1 time · wrote 1 time · 1 cancelled (3 failed)");
+    "● ran 1 command · read 1 time · edited 1 time · wrote 1 time · 1 cancelled (4 failed)");
+  for (const name of ["read", "bash", "powershell", "lookup"]) {
+    assert.equal(render([tool("codemode", [call(name, "error")], false, true)]).trim(),
+      render([tool(name, [], false, true)]).trim());
+  }
+});
+
+test("activity wording covers builtins, addon invocations, and empty or active codemode", () => {
+  const output = render([
+    tool("codemode", [
+      call("read"), call("read"), call("bash"), call("powershell"), call("bash"),
+      call("edit"), call("write"), call("write"), call("grep"), call("find"), call("ls"),
+    ]),
+    tool("lookup"), tool("lookup"),
+  ]).trim();
+  assert.equal(output,
+    "● ran 3 commands · read 2 times · edited 1 time · wrote 2 times · searched text 1 time · searched for files 1 time · listed files 1 time · used lookup 2 times");
+  assert.equal(render([tool("codemode")]).trim(), "● no operations");
+  assert.equal(render([tool("codemode", [], true)]).trim(), "◌ working…");
 });
 
 test("assistant errors and abort notices survive thinking removal", () => {
@@ -255,73 +273,120 @@ test("assistant errors and abort notices survive thinking removal", () => {
   assert.match(render([assistant("", "private reasoning", false, "error")]), /Error:/);
 });
 
-test("summary lines fit narrow widths and rerender after a resize", () => {
+test("revealing mixed tools preserves native rendering, expansion, styling, and width", () => {
+  const tools = [tool("read"), tool("bash"), tool("codemode", [call("read")]), tool("lookup"), tool("unknown")];
   const chat = new Container();
-  chat.children = [tool("codemode", [call("read"), call("bash")])];
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
+  chat.children = tools;
+  const original = chat.render(160);
+  let enabled = true;
+  const restore = attach(chat, { enabled: () => enabled });
   try {
-    for (const width of [0, 1, 5, 20, 80]) {
+    for (const width of [0, 1, 3, 6, 20, 80, 160]) {
       assert.ok(chat.render(width).every((line) => visibleWidth(line) <= width));
     }
+    assert.ok(clickRow(chat, "ran 1 command")?.handled);
+    assertNativeRows(chat, tools);
+    for (const expanded of [true, false]) {
+      for (const tool of tools) tool.setExpanded(expanded);
+      for (const width of [0, 1, 3, 6, 20, 80, 160]) {
+        assert.ok(chat.render(width).every((line) => visibleWidth(line) <= width));
+      }
+      assertNativeRows(chat, tools);
+    }
+    enabled = false;
+    assert.deepEqual(chat.render(160), original);
   } finally {
     restore();
   }
-  assert.match(render([tool("read")], 80), /read 1 time/);
 });
 
-test("clicks reveal groups independently and toggling off restores the original view", () => {
+test("native and addon mouse interactions survive tree indentation and leading-space removal", () => {
+  const read = tool("read");
+  const addon = tool("lookup");
+  read.updateResult({ content: [{ type: "text", text: "const cheese = true;" }], isError: false });
   const chat = new Container();
-  const first = tool("read");
-  const second = tool("bash");
-  first.updateResult({ content: [{ type: "text", text: "READ_OUTPUT" }], isError: false });
-  second.updateResult({ content: [{ type: "text", text: "COMMAND_OUTPUT" }], isError: false });
-  const originalChildren = [first, assistant("Answer"), second];
-  chat.children = originalChildren;
-  const normal = chat.render(160);
+  chat.children = [read, addon];
+  const restore = attach(chat);
+  try {
+    clickRow(chat, "read 1 time");
+    assert.doesNotMatch(plain(chat.render(160)), /const cheese/);
+    assert.ok(clickRow(chat, "read src/a.ts")?.handled);
+    assert.match(plain(chat.render(160)), /const cheese/);
+    assertNativeRows(chat, [read, addon]);
+    assert.ok(clickRow(chat, "read src/a.ts")?.handled);
+    assert.doesNotMatch(plain(chat.render(160)), /const cheese/);
+
+    addonEvents.length = 0;
+    assert.equal(clickRow(chat, "LOOKUP_PREVIEW", { x: 1 }), undefined);
+    assert.equal(addonEvents.length, 0);
+    assert.ok(clickRow(chat, "LOOKUP_PREVIEW")?.handled);
+    const event = addonEvents[0];
+    assert.ok(event);
+    assert.deepEqual({ x: event.x, y: event.y, width: event.width, height: event.height },
+      { x: 3, y: 0, width: 156, height: 1 });
+    assert.equal(event.screenX, 7);
+    assert.equal(event.screenY, chat.render(160).findIndex((line) => plain([line]).includes("LOOKUP_PREVIEW")));
+    // The addon's handled click must not become the host's expansion click.
+    assert.match(plain(chat.render(160)), /LOOKUP_PREVIEW/);
+    assert.doesNotMatch(plain(chat.render(160)), /LOOKUP_DETAILS/);
+  } finally {
+    restore();
+  }
+});
+
+test("revealed groups follow streaming updates while other groups and expanded details stay hidden", () => {
+  const first = tool("codemode", [call("read", "running")], true);
+  const chat = new Container();
+  chat.addChild(first);
   const originalRender = chat.render;
   let enabled = true;
   let repaints = 0;
-  const restore = installTranscriptView(chat, {
+  const restore = attach(chat, {
     enabled: () => enabled,
-    theme: () => activeTheme,
-    padding: () => 1,
     requestRender: () => { repaints++; },
-    incompatible: (error) => { throw error; },
   });
-  const grouped = chat.render(160).join("\n");
-  assert.match(grouped, /read 1 time/);
-  assert.doesNotMatch(grouped, /Thinking|READ_OUTPUT|COMMAND_OUTPUT/);
+  try {
+    assert.equal(clickRow(chat, "read 1 time", { type: "drag" }), undefined);
+    assert.equal(clickRow(chat, "read 1 time", { button: "right" }), undefined);
+    assert.equal(clickRow(chat, "read 1 time", { y: 0 }), undefined);
+    assert.equal(repaints, 0);
+    assert.ok(clickRow(chat, "read 1 time")?.handled);
+    assert.equal(repaints, 1);
+    first.updateResult({
+      content: [{ type: "text", text: "COMPLETED_READ" }],
+      details: { calls: [call("read")] }, isError: false,
+    });
+    chat.addChild(assistant());
+    const next = tool("bash");
+    chat.addChild(next);
+    assert.match(plain(chat.render(160)), /ran 1 command · read 1 time/);
+    assertNativeRows(chat, [first, next]);
 
-  assert.equal(clickSummary(chat, "read 1 time", { type: "drag" }), undefined);
-  assert.equal(clickSummary(chat, "read 1 time", { button: "right" }), undefined);
-  assert.equal(clickSummary(chat, "read 1 time", { y: 0 }), undefined);
-  assert.equal(repaints, 0);
-  assert.ok(clickSummary(chat, "read 1 time")?.handled);
-  assert.equal(repaints, 1);
-  const firstOpen = chat.render(160).join("\n");
-  assert.match(plain(chat.render(160)), /read 1 time[\s\S]*└─ read/);
-  assert.doesNotMatch(firstOpen, /Thinking|READ_OUTPUT|COMMAND_OUTPUT/);
+    chat.addChild(assistant("New finding"));
+    const hidden = tool("lookup");
+    chat.addChild(hidden);
+    // Pi's Ctrl+O updates the original rows, including hidden ones.
+    for (const component of [first, next, hidden]) component.setExpanded(true);
+    assert.match(plain(chat.render(160)), /COMPLETED_READ/);
+    assert.doesNotMatch(plain(chat.render(160)), /LOOKUP_DETAILS/);
+    clickRow(chat, "used lookup");
+    assert.match(plain(chat.render(160)), /LOOKUP_DETAILS/);
+    clickRow(chat, "ran 1 command");
+    assert.doesNotMatch(plain(chat.render(160)), /COMPLETED_READ/);
+    assert.match(plain(chat.render(160)), /LOOKUP_DETAILS/);
 
-  assert.ok(clickSummary(chat, "ran 1 command")?.handled);
-  assert.match(plain(chat.render(160)), /└─ read[\s\S]*└─ bash/);
-  assert.ok(clickSummary(chat, "read 1 time")?.handled);
-  const firstClosed = chat.render(160).join("\n");
-  assert.doesNotMatch(firstClosed, /READ_OUTPUT|Thinking/);
-  assert.doesNotMatch(plain(chat.render(160)), /└─ read/);
-  assert.match(plain(chat.render(160)), /└─ bash/);
-  assert.equal(chat.children, originalChildren);
-
-  enabled = false;
-  assert.deepEqual(chat.render(160), normal);
-  restore();
-  assert.equal(chat.render, originalRender);
+    enabled = false;
+    const normal = chat.render(160);
+    assert.match(plain(normal), /COMPLETED_READ/);
+    restore();
+    assert.equal(chat.render, originalRender);
+    assert.deepEqual(chat.render(160), normal);
+  } finally {
+    restore();
+  }
 });
 
-test("render failure always restores the original child arrays", () => {
+test("render failures restore the original transcript and assistant contents", () => {
   const chat = new Container();
   const reply = assistant("Answer");
   const originalChildren = [tool("read"), reply];
@@ -329,24 +394,21 @@ test("render failure always restores the original child arrays", () => {
   const originalReply = reply.render(160);
   const originalRender = reply.render;
   reply.render = () => { throw new Error("renderer failed"); };
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
-  assert.throws(() => chat.render(160), /renderer failed/);
-  assert.equal(chat.children, originalChildren);
-  reply.render = originalRender;
-  assert.deepEqual(reply.render(160), originalReply);
-  restore();
+  const restore = attach(chat);
+  try {
+    assert.throws(() => chat.render(160), /renderer failed/);
+    assert.equal(chat.children, originalChildren);
+    reply.render = originalRender;
+    assert.deepEqual(reply.render(160), originalReply);
+  } finally {
+    reply.render = originalRender;
+    restore();
+  }
 });
 
 test("incompatible codemode details fail visibly and retain normal rendering", () => {
   for (const details of [
-    null,
-    {},
-    { calls: "changed" },
-    { calls: [null] },
+    null, {}, { calls: "changed" }, { calls: [null] },
     { calls: [{ name: 42, status: "ok" }] },
     { calls: [{ name: "read", status: "changed" }] },
   ]) {
@@ -356,183 +418,14 @@ test("incompatible codemode details fail visibly and retain normal rendering", (
     chat.addChild(component);
     const normal = chat.render(160);
     let reported = false;
-    const restore = installTranscriptView(chat, {
-      enabled: () => true, theme: () => activeTheme, padding: () => 1,
-      requestRender: () => {},
-      incompatible: (error) => { reported = error instanceof ViewShapeError; },
-    });
-    assert.deepEqual(chat.render(160), normal);
-    assert.ok(reported);
-    restore();
+    const restore = attach(chat, { incompatible: (error) => { reported = error instanceof ViewShapeError; } });
+    try {
+      assert.deepEqual(chat.render(160), normal);
+      assert.ok(reported);
+    } finally {
+      restore();
+    }
   }
-});
-
-test("Pi's global detail expansion changes only what revealed groups display", () => {
-  function detailTool(name: string) {
-    const component = new ToolExecutionComponent(name, String(++toolId), {}, {}, {
-      renderCall: () => new Text(`${name} row`, 0, 0),
-      renderResult: (_result: unknown, options: { expanded: boolean }) =>
-        new Text(options.expanded ? `${name} FULL_DETAILS` : `${name} MINIMAL`, 0, 0),
-    }, tui, process.cwd());
-    component.updateResult({ content: [], isError: false });
-    return component;
-  }
-  const first = detailTool("read");
-  const second = detailTool("bash");
-  const chat = new Container();
-  chat.children = [first, assistant("Answer"), second];
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
-  clickSummary(chat, "read 1 time");
-  assert.match(chat.render(160).join("\n"), /read MINIMAL/);
-  assert.doesNotMatch(chat.render(160).join("\n"), /FULL_DETAILS|bash MINIMAL/);
-
-  // Pi's unchanged Ctrl+O action calls setExpanded() on all the original tool rows.
-  first.setExpanded(true);
-  second.setExpanded(true);
-  const expanded = chat.render(160).join("\n");
-  assert.match(expanded, /read FULL_DETAILS/);
-  assert.doesNotMatch(expanded, /bash FULL_DETAILS/);
-
-  clickSummary(chat, "ran 1 command");
-  assert.match(chat.render(160).join("\n"), /read FULL_DETAILS[\s\S]*bash FULL_DETAILS/);
-  clickSummary(chat, "read 1 time");
-  assert.doesNotMatch(chat.render(160).join("\n"), /read FULL_DETAILS/);
-  first.setExpanded(false);
-  second.setExpanded(false);
-  assert.match(chat.render(160).join("\n"), /bash MINIMAL/);
-  assert.doesNotMatch(chat.render(160).join("\n"), /FULL_DETAILS|read MINIMAL/);
-  restore();
-});
-
-test("revealed groups stay open while snapshots and consecutive tool rows arrive", () => {
-  const first = tool("codemode", [call("read", "running")], true);
-  const chat = new Container();
-  chat.addChild(first);
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
-  clickSummary(chat, "read 1 time");
-  first.updateResult({
-    content: [{ type: "text", text: "COMPLETED_READ" }],
-    details: { calls: [call("read")] }, isError: false,
-  });
-  chat.addChild(assistant());
-  const next = tool("bash");
-  next.updateResult({ content: [{ type: "text", text: "NEXT_COMMAND" }], isError: false });
-  chat.addChild(next);
-  const continued = chat.render(160).join("\n");
-  assert.match(continued, /ran 1 command · read 1 time/);
-  assert.match(plain(chat.render(160)), /├─ 1 tool call · 1 read[\s\S]*└─ bash/);
-  assert.doesNotMatch(continued, /Thinking|COMPLETED_READ|NEXT_COMMAND/);
-  first.setExpanded(true);
-  next.setExpanded(true);
-  assert.match(chat.render(160).join("\n"), /COMPLETED_READ[\s\S]*NEXT_COMMAND/);
-
-  chat.addChild(assistant("New finding"));
-  const newGroup = tool("read");
-  newGroup.updateResult({ content: [{ type: "text", text: "NEXT_GROUP" }], isError: false });
-  chat.addChild(newGroup);
-  assert.doesNotMatch(chat.render(160).join("\n"), /NEXT_GROUP/);
-  clickSummary(chat, "ran 1 command");
-  assert.doesNotMatch(chat.render(160).join("\n"), /COMPLETED_READ|NEXT_COMMAND|NEXT_GROUP/);
-  restore();
-});
-
-test("revealed groups contain one original minimal row per block without child dots", () => {
-  const first = tool("codemode", [
-    call("bash", "ok", { command: "npm test" }),
-    call("read", "ok", { path: "src/a.ts" }),
-  ]);
-  const last = tool("codemode", [call("edit", "error", { path: "src/a.ts" })], false, true);
-  const chat = new Container();
-  chat.children = [first, assistant(), last];
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
-  clickSummary(chat, "ran 1 command");
-  const collapsed = plain(chat.render(160));
-  assert.equal(collapsed.trim(),
-    "● ran 1 command · read 1 time · edited 1 time (1 failed)\n ├─ 2 tool calls · 1 command · 1 read\n └─ 1 tool call · 1 edit (1 failed)");
-  assert.equal((collapsed.match(/●/g) ?? []).length, 1);
-  assert.doesNotMatch(collapsed, /npm test|src\/a.ts|Thinking|fixture_script/);
-  first.setExpanded(true);
-  last.setExpanded(true);
-  const expanded = chat.render(160);
-  assert.match(plain(expanded), /fixture_script/);
-  assert.equal((plain(expanded).match(/●/g) ?? []).length, 1);
-  assert.ok(expanded.some((line) => line.includes("\x1b[48;")));
-  for (const width of [0, 1, 3, 6, 20, 80]) {
-    assert.ok(chat.render(width).every((line) => visibleWidth(line) <= width));
-  }
-  restore();
-});
-
-test("clicking a child row preserves native expansion, styling and mouse coordinates", () => {
-  const definition = minimalTool(createReadToolDefinition(process.cwd()), {
-    call: (args) => `read ${args.path}`,
-    result: (args) => `read ${args.path}`,
-    callBody: false,
-  });
-  const component = new ToolExecutionComponent("read", String(++toolId), { path: "src/a.ts" }, {},
-    definition, tui, process.cwd());
-  component.updateResult({ content: [{ type: "text", text: "const cheese = true;" }], isError: false });
-  const chat = new Container();
-  chat.addChild(component);
-  let enabled = true;
-  const restore = installTranscriptView(chat, {
-    enabled: () => enabled, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
-  clickSummary(chat, "read 1 time");
-  assert.equal(plain(chat.render(160)).trim(), "● read 1 time\n └─ read src/a.ts");
-  assert.ok(clickSummary(chat, "read src/a.ts")?.handled);
-  const expanded = chat.render(160);
-  assert.match(plain(expanded), /const cheese = true;/);
-  assert.equal((plain(expanded).match(/●/g) ?? []).length, 1);
-  assert.ok(expanded.some((line) => line.includes("\x1b[48;")));
-  assert.ok(clickSummary(chat, "read src/a.ts")?.handled);
-  assert.doesNotMatch(plain(chat.render(160)), /const cheese/);
-
-  enabled = false;
-  assert.equal(plain(chat.render(160)).trim(), "● read src/a.ts");
-  enabled = true;
-  assert.equal(plain(chat.render(160)).trim(), "● read 1 time\n └─ read src/a.ts");
-  restore();
-});
-
-test("clicking one block expands only that block and global expansion still affects hidden blocks", () => {
-  const first = tool("codemode", [call("read")]);
-  const second = tool("codemode", [call("bash"), call("bash")]);
-  const hidden = tool("codemode", [call("edit")]);
-  const chat = new Container();
-  chat.children = [first, second, assistant("Finding"), hidden];
-  const restore = installTranscriptView(chat, {
-    enabled: () => true, theme: () => activeTheme, padding: () => 1,
-    requestRender: () => {},
-    incompatible: (error) => { throw error; },
-  });
-  clickSummary(chat, "ran 2 commands");
-  assert.ok(clickSummary(chat, "1 tool call · 1 read")?.handled);
-  assert.equal((plain(chat.render(160)).match(/fixture_script/g) ?? []).length, 1);
-  assert.ok(clickSummary(chat, "1 tool call · 1 read")?.handled);
-  assert.doesNotMatch(plain(chat.render(160)), /fixture_script/);
-
-  for (const component of [first, second, hidden]) component.setExpanded(true);
-  assert.equal((plain(chat.render(160)).match(/fixture_script/g) ?? []).length, 2);
-  clickSummary(chat, "edited 1 time");
-  assert.equal((plain(chat.render(160)).match(/fixture_script/g) ?? []).length, 3);
-  clickSummary(chat, "ran 2 commands");
-  assert.equal((plain(chat.render(160)).match(/fixture_script/g) ?? []).length, 1);
-  restore();
 });
 
 test("chat discovery follows the mounted document rather than any nested container", () => {

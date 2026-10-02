@@ -1,6 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Container, truncateToWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { withMinimalTreeRow } from "./tool-render.ts";
 
 class TreeRow implements Component {
   private contentWidth = 0;
@@ -15,16 +14,11 @@ class TreeRow implements Component {
     private readonly padding: number,
   ) {}
 
-  private withTreeStyle<T>(action: () => T) {
-    const state = "rendererState" in this.tool ? this.tool.rendererState : undefined;
-    return withMinimalTreeRow(state, action);
-  }
-
   render(width: number): string[] {
     const inset = Math.min(this.padding, Math.max(0, width));
     this.offsetX = inset + 3;
     this.contentWidth = Math.max(0, width - this.offsetX);
-    const source = this.withTreeStyle(() => this.tool.render(this.contentWidth));
+    const source = this.tool.render(this.contentWidth);
     this.contentHeight = source.length;
     this.skipped = 0;
     // Pi adds a leading spacer to each tool. The aggregate already separates this list.
@@ -39,13 +33,13 @@ class TreeRow implements Component {
 
   handleMouse(event: TuiMouseEvent) {
     if (event.x < this.offsetX) return undefined;
-    return this.withTreeStyle(() => this.tool.handleMouse?.({
+    return this.tool.handleMouse?.({
       ...event,
       x: event.x - this.offsetX,
       y: event.y + this.skipped,
       width: this.contentWidth,
       height: this.contentHeight,
-    }));
+    });
   }
 
   invalidate() {

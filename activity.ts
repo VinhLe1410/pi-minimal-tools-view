@@ -31,7 +31,6 @@ export function summarizeActivity(snapshots: readonly ActivitySnapshot[]) {
   let running = 0;
   let failed = 0;
   let cancelled = 0;
-  let wrapperFailures = 0;
   let active = false;
   for (const snapshot of snapshots) {
     let callFailures = 0;
@@ -42,10 +41,9 @@ export function summarizeActivity(snapshots: readonly ActivitySnapshot[]) {
       if (call.status === "cancelled") cancelled++;
       if (call.status === "error") callFailures++;
     }
-    failed += callFailures;
     // A failed wrapper adds a failure only when none of its calls failed.
-    if (snapshot.scriptFailed && callFailures === 0) wrapperFailures++;
+    failed += callFailures || (snapshot.scriptFailed ? 1 : 0);
     active ||= snapshot.active;
   }
-  return { counts, running, failed, cancelled, wrapperFailures, active };
+  return { counts, running, failed, cancelled, active };
 }

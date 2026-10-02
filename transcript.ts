@@ -93,8 +93,7 @@ function summaryText(summary: ReturnType<typeof summarizeActivity>) {
   if (summary.running) parts.push(`${summary.running} running`);
   if (summary.cancelled) parts.push(`${summary.cancelled} cancelled`);
   const text = parts.join(" · ");
-  const failed = summary.failed + summary.wrapperFailures;
-  if (failed) return `${text ? text + " " : ""}(${failed} failed)`;
+  if (summary.failed) return `${text ? text + " " : ""}(${summary.failed} failed)`;
   return text || (summary.active ? "working…" : "no operations");
 }
 
@@ -102,7 +101,7 @@ function summaryComponent(group: Group, theme: Theme, padding: number, interacti
   const summary: Component = {
     render(width) {
       const summary = summarizeActivity(group.tools.map(toolSnapshot));
-      const color = summary.failed || summary.wrapperFailures ? "error" : summary.cancelled ? "warning" : "muted";
+      const color = summary.failed ? "error" : summary.cancelled ? "warning" : "muted";
       const prefix = theme.fg(summary.active ? "accent" : color, summary.active ? "◌" : "●");
       const inset = Math.min(padding, Math.max(0, width));
       const line = prefix + " " + theme.fg("muted", summaryText(summary));

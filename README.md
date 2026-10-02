@@ -1,15 +1,12 @@
 # pi-minimal-tools-view
 
-Minimal tool views for [Pi](https://pi.dev). Consecutive tool activity shares one summary. Click it to reveal per-block rows, then click a row or press Ctrl+O to inspect its details.
+Minimal tool views for [Pi](https://pi.dev). Consecutive tool activity shares one summary:
 
 ```text
 ● ran 3 commands · read 5 times · edited 2 times (1 failed)
-├─ 4 tool calls · 2 reads · 2 edits
-├─ 3 tool calls · 2 commands · 1 read
-└─ 3 tool calls · 1 command · 2 reads
 ```
 
-The aggregate header keeps its status dot. Child rows use tree connectors instead of big dots. Detailed views retain their backgrounds, syntax-highlighted source, output, and diffs.
+Click the summary to reveal the original tool rows under tree connectors. Builtins, codemode, and addon tools keep their native renderers, previews, details, and interactions. This extension groups their display without registering or replacing any tools.
 
 ## Install
 
@@ -17,28 +14,20 @@ The aggregate header keeps its status dot. Child rows use tree connectors instea
 pi install git:github.com/VinhLe1410/pi-minimal-tools-view
 ```
 
-This package provides its own renderer-backed codemode extension. Disable Pi's built-in codemode extension through `/config`, or merge this exclusion into your agent settings:
+Keep your normal tool and addon configuration. This package does not provide codemode or change which tools are active. Aggregation starts enabled.
 
-```json
-{
-  "extensions": ["-builtin:codemode"]
-}
-```
-
-Do not replace other existing extension settings. Disable any other extensions that replace the same tool renderers. Run `/reload` after changing the configuration.
-
-Aggregation starts enabled. Codemode is available through the package. To select codemode alongside Pi's default tools, merge `"+codemode"` into `defaultTools`.
+**Upgrading from the replacement-renderer version:** remove the `"-builtin:codemode"` exclusion added for this package, or re-enable Pi's built-in codemode through `/config`. Keep other extension settings and your existing tool selection. Run `/reload` after updating.
 
 ## Controls
 
 | Action | Behavior |
 | --- | --- |
-| Click an aggregate summary | Reveal or regroup its per-block rows |
-| Click a child row | Toggle that block's original detailed view |
+| Click an aggregate summary | Reveal or regroup the original tool rows |
+| Interact with a revealed row | Use its native click and expansion behavior |
 | Ctrl+O | Keep Pi's normal global tool-detail expansion |
 | `/minimal-tools-view` | Toggle aggregation |
 | `/minimal-tools-view on` | Enable aggregation |
-| `/minimal-tools-view off` | Show standalone tool rows and thinking |
+| `/minimal-tools-view off` | Restore the normal transcript, including thinking |
 
 Hidden groups stay aggregated even when Ctrl+O expands their underlying tools. Revealing a group afterward shows those details immediately.
 
@@ -52,15 +41,19 @@ Reload resets aggregation to on and regroups revealed rows.
 - Thinking is completely hidden while aggregation is enabled. Thinking-only turns do not split groups.
 - The input border stays `Working…`, without counts.
 - Counts describe invocations, not unique files. Bash and PowerShell invocations count as commands.
-- Codemode children keep counts for their own block. They are not flattened into individual command rows.
+- Codemode contributes its reported child calls to the aggregate. Revealing it shows the original codemode row, not separate child rows.
+- Addon tools count as invocations, with wording such as `used lookup 2 times`. Their internal work is not counted unless it appears in codemode child-call details.
 - Running and cancelled counts remain visible. Failures end the aggregate line as `(n failed)`.
-- Tool execution, model-facing results, and saved messages are unchanged.
+- Tool registration, execution, settings, model-facing results, and saved messages are unchanged.
+- Revealed rows can include native output previews. They no longer use this package's custom per-block summaries or detail styling.
 
 ## Compatibility
 
 Tested against Pi 1.0.0. The transcript view uses private Pi component fields and layout. Detected shape changes disable aggregation and show a warning.
 
-There are no global component-prototype patches or keyboard interception. Tree wrappers reuse the original tool components and forward mouse coordinates.
+There are no tool replacements, renderer-state changes, global component-prototype patches, or keyboard interception. Tree wrappers reuse the original tool components and forward mouse coordinates. Rows render within the width left after indentation and tree connectors.
+
+Addon renderers are not individually certified. They must follow Pi's component width and input contracts.
 
 Revealed state follows the first tool component in each group. New consecutive blocks stay revealed during streaming. Rebuilding history resets reveal state. The view rebuilds on each render rather than caching large histories.
 
@@ -88,13 +81,10 @@ Pi supplies the runtime peer dependencies. Matching host packages are developmen
 ## Layout
 
 - `index.ts`: the only extension entry point.
-- `builtins.ts`: built-in tool definitions and minimal renderers.
-- `codemode.ts`: codemode definition and per-block renderer.
-- `activity.ts`: shared call validation and activity counts.
+- `activity.ts`: call validation and activity counts.
 - `session-view.ts`: session lifecycle, working label, and toggle command.
 - `transcript.ts`: host-shape checks, grouping, and visibility.
 - `tree.ts`: branch connectors and mouse forwarding.
-- `tool-render.ts`: shared tool rendering and detailed components.
 - `tests/minimal-tools-view.test.ts`: UI regression tests.
 
 The package is distributed through Git. It is marked private to prevent accidental npm publication.
